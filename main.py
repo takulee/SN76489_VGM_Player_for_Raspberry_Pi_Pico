@@ -1,0 +1,386 @@
+import machine
+machine.freq(250_000_000)     # 標準は125MHz。不安定な場合は 200_000_000 に下げるか、この2行を削除
+
+from machine import Pin
+import time
+from time import ticks_us, ticks_diff, ticks_add, sleep_us
+import os
+
+# ---- 再生設定 ----
+VGM_DIR = "/vgm"          # VGMファイルを置いたフォルダ ("/" ならルート)
+REPEAT_PLAYLIST = False   # True にすると全曲を再生し終えたあと最初から繰り返す
+LOOP_COUNT = 1            # 1曲ごとのループ回数 (0=ループしない, -1=無限)
+BUF_SIZE = 2048           # ファイル読み込みバッファ(バイト)
+STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるまでの無音時間(ms)
+
+# ---- テスト用の出力設定 ----
+# 使う物理IC: "both"=2個とも / "first"=1個目だけ / "second"=2個目だけ
+PLAY_MODE = "both"
+# "first" / "second" のとき、VGMの何個目のチップのデータを鳴らすか
+# (0=VGMの1個目(コマンド0x50), 1=VGMの2個目(コマンド0x30))
+SINGLE_SOURCE = 0
+# "both" のとき、VGMの1個目と2個目を物理IC側で入れ替える
+SWAP_CHIPS = False
+
+CLOCK_HZ = 3579545        # 外部水晶発振器の周波数 (2個のチップで共通)
+
+# ---- ピン設定 ----
+DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # D0..D7 -> GP0..GP7 (D0 = MSB)。2個で共通
+# 各物理ICの制御ピン (WE, READY, CE)
+CHIP_PINS = [
+    (10, 11, 12),   # 1個目
+    (13, 14, 15),   # 2個目
+]
+
+data = [Pin(p, Pin.OUT, value=0) for p in DATA_PINS]
+we = [Pin(p[0], Pin.OUT, value=1) for p in CHIP_PINS]      # アクティブLow
+ready = [Pin(p[1], Pin.IN) for p in CHIP_PINS]
+ce = [Pin(p[2], Pin.OUT, value=1) for p in CHIP_PINS]      # アクティブLow (GND直結なら未接続でOK)
+
+
+# ---- 出力設定の解決 ----
+def make_route():
+    """ROUTE[v] = VGMのv個目のデータを送る物理IC番号 (送らないなら None)"""
+    if PLAY_MODE == "both":
+        return [1, 0] if SWAP_CHIPS else [0, 1]
+    if PLAY_MODE == "first":
+        phys = 0
+    elif PLAY_MODE == "second":
+        phys = 1
+    else:
+        raise ValueError('PLAY_MODE は "both" / "first" / "second" のいずれかにしてください')
+    route = [None, None]
+    route[SINGLE_SOURCE] = phys
+    return route
+
+
+ROUTE = make_route()
+ACTIVE = [0, 1] if PLAY_MODE == "both" else [0 if PLAY_MODE == "first" else 1]   # 使う物理IC
+
+
+# ---- SN76489 低レベル制御 ----
+def _wait_ready(pin, level, timeout_us=1000):
+    t0 = ticks_us()
+    while pin.value() != level:
+        if ticks_diff(ticks_us(), t0) > timeout_us:
+            return False
+    return True
+
+
+def sn_write(n, byte):
+    """n番目(0または1)の物理ICへ1バイト書き込む(WE/READYハンドシェイク付き)"""
+    for i, p in enumerate(data):
+        p.value((byte >> (7 - i)) & 1)   # D0がMSB
+    c = ce[n]
+    w = we[n]
+    rd = ready[n]
+    c.value(0)
+    w.value(0)                           # 書き込み開始
+    _wait_ready(rd, 0)                   # READYがLow(受信中)
+    _wait_ready(rd, 1)                   # READYがHigh(受付完了)
+    w.value(1)                           # 書き込み終了
+    c.value(1)
+
+
+def mute_all():
+    for n in ACTIVE:                     # 使う物理ICだけ消音
+        for ch in range(4):
+            sn_write(n, 0x90 | (ch << 5) | 0x0F)   # 減衰量15 = 無音
+
+
+def startup_mute():
+    """電源ON直後の不定状態を消音する。クロックが安定するまで待ち、念のため複数回書き込む"""
+    time.sleep_ms(100)
+    for _ in range(3):
+        mute_all()
+        time.sleep_ms(20)
+
+
+# ---- クロック補正 ----
+def make_writer(sn_clock, n):
+    """n番目の物理ICへ書き込む関数を返す。クロックが違う場合は音程レジスタを補正する"""
+    if abs(sn_clock - CLOCK_HZ) * 1000 <= CLOCK_HZ:     # 0.1%以内なら補正なし
+        def plain(b):
+            sn_write(n, b)
+        return plain
+
+    R = (CLOCK_HZ << 16) // sn_clock       # 実機クロック / ファイルクロック (16bit固定小数)
+    tone = [0, 0, 0]                        # 各チャンネルの音程レジスタ(10bit)の記憶
+    sent = [-1, -1, -1]                     # 実際に送った値(同じ値の再送を避ける)
+    latched = [-1]                          # 最後にラッチされた音程チャンネル(-1=音程以外)
+
+    def write(b):
+        if b & 0x80:                        # ラッチバイト
+            ch = (b >> 5) & 3
+            if (b & 0x10) or ch == 3:       # 音量・ノイズはそのまま通す
+                latched[0] = -1
+                sn_write(n, b)
+                return
+            latched[0] = ch
+            tone[ch] = (tone[ch] & 0x3F0) | (b & 0x0F)
+        else:                               # データバイト
+            ch = latched[0]
+            if ch < 0:                      # 音量・ノイズの続きはそのまま通す
+                sn_write(n, b)
+                return
+            tone[ch] = ((b & 0x3F) << 4) | (tone[ch] & 0x0F)
+
+        v = tone[ch] or 1024                # レジスタ値0は1024扱い
+        v = (v * R + 32768) >> 16           # 四捨五入しながらスケーリング
+        if v < 1:
+            v = 1
+        elif v > 1024:
+            v = 1024
+        reg = v & 0x3FF                     # 1024は0で表す
+        if reg != sent[ch]:
+            sent[ch] = reg
+            sn_write(n, 0x80 | (ch << 5) | (reg & 0x0F))
+            sn_write(n, (reg >> 4) & 0x3F)
+
+    return write
+
+
+# ---- ファイル読み込み(バッファ付き・バッファ使い回し) ----
+class Reader:
+    def __init__(self, f):
+        self.f = f
+        self.buf = bytearray(BUF_SIZE)
+        self.n = 0
+        self.i = 0
+
+    def seek(self, pos):
+        self.f.seek(pos)
+        self.n = 0
+        self.i = 0
+
+    def byte(self):
+        """1バイト読む。ファイル終端なら -1"""
+        if self.i >= self.n:
+            self.n = self.f.readinto(self.buf) or 0
+            self.i = 0
+            if not self.n:
+                return -1
+        b = self.buf[self.i]
+        self.i += 1
+        return b
+
+    def skip(self, n):
+        avail = self.n - self.i
+        if n <= avail:
+            self.i += n
+        else:
+            self.f.seek(n - avail, 1)
+            self.n = 0
+            self.i = 0
+
+    def u16(self):
+        lo = self.byte()
+        hi = self.byte()
+        return lo | (hi << 8)
+
+    def u32(self):
+        v = 0
+        for s in (0, 8, 16, 24):
+            v |= self.byte() << s
+        return v
+
+
+def u32(b, o):
+    return int.from_bytes(b[o:o + 4], "little")
+
+
+def operand_len(c):
+    """SN76489以外のコマンドを読み飛ばすためのオペランド長"""
+    if 0x30 <= c <= 0x3F: return 1
+    if 0x40 <= c <= 0x4E: return 2
+    if c == 0x4F or c == 0x50: return 1   # Game Gear PSGステレオ / 1個目のSN76489
+    if 0x51 <= c <= 0x5F: return 2
+    if c == 0x68: return 11
+    if c == 0x90 or c == 0x91 or c == 0x95: return 4
+    if c == 0x92: return 5
+    if c == 0x93: return 10
+    if c == 0x94: return 1
+    if 0xA0 <= c <= 0xBF: return 2
+    if 0xC0 <= c <= 0xDF: return 3
+    if 0xE0 <= c <= 0xFF: return 4
+    return 0
+
+
+# ---- VGM再生 ----
+def play_vgm(path):
+    with open(path, "rb") as f:
+        hdr = f.read(0x40)
+        if hdr[:2] == b"\x1f\x8b":
+            print("VGZ(gzip圧縮)です。解凍して .vgm にしてください")
+            return
+        if len(hdr) < 0x40 or hdr[:4] != b"Vgm ":
+            print("VGMファイルではありません")
+            return
+
+        ver = u32(hdr, 0x08)
+        clk_field = u32(hdr, 0x0C)
+        sn_clock = clk_field & 0x3FFFFFFF
+        dual = bool(clk_field & 0x40000000)      # bit30: SN76489が2個
+        if sn_clock == 0 and ver < 0x101:
+            sn_clock = 3579545
+        if sn_clock == 0:
+            print("このファイルにSN76489のデータはありません")
+            return
+
+        # VGMのv個目のデータを送る書き込み関数 (送り先がない/ファイルにそのチップがなければ None)
+        w = [None, None]
+        for v in (0, 1):
+            phys = ROUTE[v]
+            if phys is not None and (v == 0 or dual):
+                w[v] = make_writer(sn_clock, phys)
+        w0, w1 = w
+
+        print("VGM ver %x, SN76489 clock %d Hz, ファイルのチップ数 %d"
+              % (ver, sn_clock, 2 if dual else 1))
+        print("設定: PLAY_MODE=%s, SINGLE_SOURCE=%d, SWAP_CHIPS=%s -> VGM1個目: %s, VGM2個目: %s"
+              % (PLAY_MODE, SINGLE_SOURCE, SWAP_CHIPS,
+                 ("物理IC%d" % (ROUTE[0] + 1)) if w0 else "出力なし",
+                 ("物理IC%d" % (ROUTE[1] + 1)) if w1 else "出力なし"))
+        if w0 is None and w1 is None:
+            print("再生できるデータがありません(このファイルにその番号のチップがありません)")
+            return
+        if abs(sn_clock - CLOCK_HZ) * 1000 > CLOCK_HZ:
+            print("クロック補正あり: ファイル %d Hz -> 実機 %d Hz (ノイズ周波数は補正できません)"
+                  % (sn_clock, CLOCK_HZ))
+
+        # データ開始位置
+        data_start = 0x40
+        if ver >= 0x150:
+            off = u32(hdr, 0x34)
+            if off:
+                data_start = 0x34 + off
+
+        # ループ位置
+        loop_off = u32(hdr, 0x1C)
+        loop_pos = (0x1C + loop_off) if loop_off else None
+
+        r = Reader(f)
+        r.seek(data_start)
+
+        # 時間管理: 44100Hz基準のサンプル数 -> マイクロ秒
+        t_ref = ticks_us()
+        acc = 0
+
+        def wait(n):
+            nonlocal t_ref, acc
+            acc += n
+            target = ticks_add(t_ref, acc * 10000 // 441)
+            d = ticks_diff(target, ticks_us())
+            if d > 1500:
+                sleep_us(d - 1000)
+            while ticks_diff(target, ticks_us()) > 0:
+                pass
+            if acc >= 441000:
+                chunk = acc // 441 * 441
+                t_ref = ticks_add(t_ref, chunk // 441 * 10000)
+                acc -= chunk
+
+        len62, len63 = 735, 882
+        loops_left = LOOP_COUNT
+
+        mute_all()
+        while True:
+            c = r.byte()
+            if c < 0:
+                break
+            if c == 0x50:                       # VGMの1個目のSN76489
+                b = r.byte()
+                if w0:
+                    w0(b)
+            elif c == 0x30:                     # VGMの2個目のSN76489
+                b = r.byte()
+                if w1:
+                    w1(b)
+            elif c == 0x61:
+                wait(r.u16())
+            elif c == 0x62:
+                wait(len62)
+            elif c == 0x63:
+                wait(len63)
+            elif 0x70 <= c <= 0x7F:
+                wait((c & 0x0F) + 1)
+            elif 0x80 <= c <= 0x8F:             # YM2612 DAC書き込み+待ち(待ちだけ守る)
+                wait(c & 0x0F)
+            elif c == 0x64:                     # 0x62/0x63の待ち時間変更
+                cc = r.byte()
+                n = r.u16()
+                if cc == 0x62:
+                    len62 = n
+                elif cc == 0x63:
+                    len63 = n
+            elif c == 0x66:                     # 終端 / ループ
+                if loop_pos is not None and loops_left != 0:
+                    if loops_left > 0:
+                        loops_left -= 1
+                    r.seek(loop_pos)
+                else:
+                    break
+            elif c == 0x67:                     # データブロック(PCMなど)は読み飛ばす
+                r.byte()
+                r.byte()
+                r.skip(r.u32())
+            else:
+                r.skip(operand_len(c))          # 他の音源ICのコマンドはここで読み飛ばす
+
+
+# ---- プレイリスト (拡張子ではなく中身で判定) ----
+def is_vgm(path):
+    """ファイルの先頭4バイトで VGM かどうかを判定する"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"Vgm "
+    except OSError:
+        return False
+
+
+def list_vgm(folder):
+    """フォルダ内の VGM ファイルを、ファイル名順に並べて返す"""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        print("フォルダが見つかりません:", folder)
+        return []
+    files = []
+    for nm in sorted(names):
+        if nm.startswith("."):
+            continue
+        path = folder.rstrip("/") + "/" + nm
+        try:
+            if os.stat(path)[0] & 0x4000:       # フォルダは除外
+                continue
+        except OSError:
+            continue
+        if is_vgm(path):
+            files.append(path)
+    return files
+
+
+def play_all(folder=VGM_DIR):
+    while True:
+        files = list_vgm(folder)
+        if not files:
+            print("VGMファイルが見つかりません:", folder)
+            return
+        for i, path in enumerate(files):
+            print("[%d/%d] %s" % (i + 1, len(files), path))
+            try:
+                play_vgm(path)
+            except OSError as e:
+                print("読み込みエラー:", path, e)
+            mute_all()                    # 曲の切れ目で音が残らないように
+            time.sleep_ms(500)
+        if not REPEAT_PLAYLIST:
+            break
+
+
+try:
+    startup_mute()                    # まず消音
+    time.sleep_ms(STARTUP_DELAY_MS)   # 無音のまま少し待ってから再生開始
+    play_all()
+finally:
+    mute_all()
