@@ -13,6 +13,10 @@ LOOP_COUNT = 1            # 1曲ごとのループ回数 (0=ループしない, 
 BUF_SIZE = 2048           # ファイル読み込みバッファ(バイト)
 STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるまでの無音時間(ms)
 
+# ---- 音程の調整 ----
+PITCH_SHIFT = 0.0         # 音程を半音単位で上下 (+2.5 なら半音2.5個ぶん高く、負の値で低く。小数も可)
+PITCH_BY_FILE = {}        # 曲ごとに変える場合: {"01_xxx.vgm": 2.5, "02_yyy": -1}
+
 # ---- テスト用の出力設定 ----
 # 使う物理IC: "both"=2個とも / "first"=1個目だけ / "second"=2個目だけ
 PLAY_MODE = "both"
@@ -96,15 +100,18 @@ def startup_mute():
         time.sleep_ms(20)
 
 
-# ---- クロック補正 ----
-def make_writer(sn_clock, n):
-    """n番目の物理ICへ書き込む関数を返す。クロックが違う場合は音程レジスタを補正する"""
-    if abs(sn_clock - CLOCK_HZ) * 1000 <= CLOCK_HZ:     # 0.1%以内なら補正なし
+# ---- 音程の補正(クロック差 + 音程シフト) ----
+def make_writer(sn_clock, n, shift=0.0):
+    """n番目の物理ICへ書き込む関数を返す。
+    クロックの違いと音程シフトを、音程レジスタの値の補正でまとめて行う"""
+    # N' = N * (実機クロック / ファイルクロック) / 2^(シフト/12)
+    ratio = (CLOCK_HZ / sn_clock) * 2 ** (-shift / 12)
+    if abs(ratio - 1) <= 0.001:              # 補正が不要なら、そのまま書き込む
         def plain(b):
             sn_write(n, b)
         return plain
 
-    R = (CLOCK_HZ << 16) // sn_clock       # 実機クロック / ファイルクロック (16bit固定小数)
+    R = int(ratio * 65536 + 0.5)            # 16bit固定小数
     tone = [0, 0, 0]                        # 各チャンネルの音程レジスタ(10bit)の記憶
     sent = [-1, -1, -1]                     # 実際に送った値(同じ値の再送を避ける)
     latched = [-1]                          # 最後にラッチされた音程チャンネル(-1=音程以外)
@@ -227,12 +234,15 @@ def play_vgm(path):
             print("このファイルにSN76489のデータはありません")
             return
 
+        # この曲の音程シフト量(半音)
+        shift = PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT)
+
         # VGMのv個目のデータを送る書き込み関数 (送り先がない/ファイルにそのチップがなければ None)
         w = [None, None]
         for v in (0, 1):
             phys = ROUTE[v]
             if phys is not None and (v == 0 or dual):
-                w[v] = make_writer(sn_clock, phys)
+                w[v] = make_writer(sn_clock, phys, shift)
         w0, w1 = w
 
         print("VGM ver %x, SN76489 clock %d Hz, ファイルのチップ数 %d"
@@ -245,8 +255,9 @@ def play_vgm(path):
             print("再生できるデータがありません(このファイルにその番号のチップがありません)")
             return
         if abs(sn_clock - CLOCK_HZ) * 1000 > CLOCK_HZ:
-            print("クロック補正あり: ファイル %d Hz -> 実機 %d Hz (ノイズ周波数は補正できません)"
-                  % (sn_clock, CLOCK_HZ))
+            print("クロック補正あり: ファイル %d Hz -> 実機 %d Hz" % (sn_clock, CLOCK_HZ))
+        if shift != 0:
+            print("音程シフト:", shift, "半音 (ノイズの固定周波数は変わりません)")
 
         # データ開始位置
         data_start = 0x40
