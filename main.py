@@ -17,6 +17,13 @@ STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるま�
 PITCH_SHIFT = 0.0         # 音程を半音単位で上下 (+2.5 なら半音2.5個ぶん高く、負の値で低く。小数も可)
 PITCH_BY_FILE = {}        # 曲ごとに変える場合: {"01_xxx.vgm": 2.5, "02_yyy": -1}
 
+# ---- 音量の調整 (下げる方向のみ。上げることはできません) ----
+MASTER_ATTEN = 0          # 全体の音量を下げる段数 (1段 = 約2dB、0=そのまま、15=無音)
+CHANNEL_ATTEN = [         # チャンネルごとに追加で下げる段数 [トーン1, トーン2, トーン3, ノイズ]
+    [0, 0, 0, 0],         # VGMの1個目(コマンド0x50)
+    [0, 0, 0, 0],         # VGMの2個目(コマンド0x30)
+]
+
 # ---- チャンネルのミュート ----
 # VGMの1個目 / 2個目それぞれについて、消音するチャンネルを指定
 # (1,2,3 = トーン1〜3, 4 = ノイズ)  例: [1, 4] でトーン1とノイズを消音
@@ -155,31 +162,41 @@ def make_writer(sn_clock, n, shift=0.0):
     return write
 
 
-# ---- チャンネルのミュート ----
-def make_mute_filter(sink, muted):
-    """ミュートするチャンネルの音量を強制的に「無音(減衰量15)」に書き換えるフィルタ。
-    muted は 1〜4 の番号のリスト (1,2,3=トーン, 4=ノイズ)"""
-    mask = 0
+# ---- 音量の調整・ミュート ----
+def make_volume_filter(sink, muted, ch_atten):
+    """音量の書き込みに減衰量を足して音量を下げるフィルタ(ミュートは減衰量15)。
+    muted は 1〜4 の番号のリスト (1,2,3=トーン, 4=ノイズ)。ch_atten は [トーン1,トーン2,トーン3,ノイズ]"""
+    add = [0, 0, 0, 0]
+    for ch in range(4):
+        a = MASTER_ATTEN + ch_atten[ch]
+        add[ch] = 0 if a < 0 else (15 if a > 15 else a)
     for ch in muted:
         if 1 <= ch <= 4:
-            mask |= 1 << (ch - 1)
-    if mask == 0:
-        return sink                          # ミュートなしなら何もしない
+            add[ch - 1] = 15
+    if add == [0, 0, 0, 0]:
+        return sink                          # 調整なしなら何もしない
 
-    latched = [-1]      # 最後にラッチされた「ミュート中チャンネルの音量レジスタ」(-1=それ以外)
+    latched = [-1]      # 最後にラッチされた「減衰を足すチャンネルの音量レジスタ」(-1=それ以外)
 
     def write(b):
         if b & 0x80:                         # ラッチバイト
             ch = (b >> 5) & 3
-            if (b & 0x10) and (mask >> ch) & 1:     # ミュート中チャンネルの音量
+            if (b & 0x10) and add[ch]:       # 減衰を足すチャンネルの音量
+                att = (b & 0x0F) + add[ch]
+                if att > 15:
+                    att = 15
                 latched[0] = ch
-                sink(b | 0x0F)                       # 減衰量15 = 無音
+                sink((b & 0xF0) | att)
                 return
             latched[0] = -1
             sink(b)
         else:                                # データバイト
-            if latched[0] >= 0:              # ミュート中チャンネルの音量の続き
-                sink(0x0F)
+            ch = latched[0]
+            if ch >= 0:                      # 音量の続き
+                att = (b & 0x0F) + add[ch]
+                if att > 15:
+                    att = 15
+                sink((b & 0x70) | att)
             else:
                 sink(b)
 
@@ -277,12 +294,13 @@ def play_vgm(path):
         shift = PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT)
 
         # VGMのv個目のデータを送る書き込み関数 (送り先がない/ファイルにそのチップがなければ None)
-        # 流れ: VGMのデータ -> ミュート -> 音程補正 -> 物理ICへ書き込み
+        # 流れ: VGMのデータ -> 音量調整・ミュート -> 音程補正 -> 物理ICへ書き込み
         w = [None, None]
         for v in (0, 1):
             phys = ROUTE[v]
             if phys is not None and (v == 0 or dual):
-                w[v] = make_mute_filter(make_writer(sn_clock, phys, shift), MUTE_CH[v])
+                w[v] = make_volume_filter(make_writer(sn_clock, phys, shift),
+                                          MUTE_CH[v], CHANNEL_ATTEN[v])
         w0, w1 = w
 
         print("VGM ver %x, SN76489 clock %d Hz, ファイルのチップ数 %d"
@@ -298,9 +316,14 @@ def play_vgm(path):
             print("クロック補正あり: ファイル %d Hz -> 実機 %d Hz" % (sn_clock, CLOCK_HZ))
         if shift != 0:
             print("音程シフト:", shift, "半音 (ノイズの固定周波数は変わりません)")
+        if MASTER_ATTEN != 0:
+            print("マスター音量: -%d段 (約-%d dB)" % (MASTER_ATTEN, MASTER_ATTEN * 2))
         for v in (0, 1):
-            if w[v] and MUTE_CH[v]:
-                print("ミュート: VGMの%d個目 チャンネル" % (v + 1), MUTE_CH[v])
+            if w[v]:
+                if any(CHANNEL_ATTEN[v]):
+                    print("チャンネル別の減衰: VGMの%d個目" % (v + 1), CHANNEL_ATTEN[v])
+                if MUTE_CH[v]:
+                    print("ミュート: VGMの%d個目 チャンネル" % (v + 1), MUTE_CH[v])
 
         # データ開始位置
         data_start = 0x40
