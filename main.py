@@ -17,6 +17,14 @@ STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるま�
 PITCH_SHIFT = 0.0         # 音程を半音単位で上下 (+2.5 なら半音2.5個ぶん高く、負の値で低く。小数も可)
 PITCH_BY_FILE = {}        # 曲ごとに変える場合: {"01_xxx.vgm": 2.5, "02_yyy": -1}
 
+# ---- チャンネルのミュート ----
+# VGMの1個目 / 2個目それぞれについて、消音するチャンネルを指定
+# (1,2,3 = トーン1〜3, 4 = ノイズ)  例: [1, 4] でトーン1とノイズを消音
+MUTE_CH = [
+    [],      # VGMの1個目(コマンド0x50)
+    [],      # VGMの2個目(コマンド0x30)
+]
+
 # ---- テスト用の出力設定 ----
 # 使う物理IC: "both"=2個とも / "first"=1個目だけ / "second"=2個目だけ
 PLAY_MODE = "both"
@@ -147,6 +155,37 @@ def make_writer(sn_clock, n, shift=0.0):
     return write
 
 
+# ---- チャンネルのミュート ----
+def make_mute_filter(sink, muted):
+    """ミュートするチャンネルの音量を強制的に「無音(減衰量15)」に書き換えるフィルタ。
+    muted は 1〜4 の番号のリスト (1,2,3=トーン, 4=ノイズ)"""
+    mask = 0
+    for ch in muted:
+        if 1 <= ch <= 4:
+            mask |= 1 << (ch - 1)
+    if mask == 0:
+        return sink                          # ミュートなしなら何もしない
+
+    latched = [-1]      # 最後にラッチされた「ミュート中チャンネルの音量レジスタ」(-1=それ以外)
+
+    def write(b):
+        if b & 0x80:                         # ラッチバイト
+            ch = (b >> 5) & 3
+            if (b & 0x10) and (mask >> ch) & 1:     # ミュート中チャンネルの音量
+                latched[0] = ch
+                sink(b | 0x0F)                       # 減衰量15 = 無音
+                return
+            latched[0] = -1
+            sink(b)
+        else:                                # データバイト
+            if latched[0] >= 0:              # ミュート中チャンネルの音量の続き
+                sink(0x0F)
+            else:
+                sink(b)
+
+    return write
+
+
 # ---- ファイル読み込み(バッファ付き・バッファ使い回し) ----
 class Reader:
     def __init__(self, f):
@@ -238,11 +277,12 @@ def play_vgm(path):
         shift = PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT)
 
         # VGMのv個目のデータを送る書き込み関数 (送り先がない/ファイルにそのチップがなければ None)
+        # 流れ: VGMのデータ -> ミュート -> 音程補正 -> 物理ICへ書き込み
         w = [None, None]
         for v in (0, 1):
             phys = ROUTE[v]
             if phys is not None and (v == 0 or dual):
-                w[v] = make_writer(sn_clock, phys, shift)
+                w[v] = make_mute_filter(make_writer(sn_clock, phys, shift), MUTE_CH[v])
         w0, w1 = w
 
         print("VGM ver %x, SN76489 clock %d Hz, ファイルのチップ数 %d"
@@ -258,6 +298,9 @@ def play_vgm(path):
             print("クロック補正あり: ファイル %d Hz -> 実機 %d Hz" % (sn_clock, CLOCK_HZ))
         if shift != 0:
             print("音程シフト:", shift, "半音 (ノイズの固定周波数は変わりません)")
+        for v in (0, 1):
+            if w[v] and MUTE_CH[v]:
+                print("ミュート: VGMの%d個目 チャンネル" % (v + 1), MUTE_CH[v])
 
         # データ開始位置
         data_start = 0x40
