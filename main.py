@@ -1,7 +1,7 @@
 import machine
-machine.freq(250_000_000)     # 標準は125MHz。不安定な場合は 200_000_000 に下げるか、この2行を削除
+machine.freq(250_000_000)     # 標準は125MHz。2MHzのクロックを正確に出すには250MHzが最適(割り切れる)
 
-from machine import Pin
+from machine import Pin, PWM
 import time
 from time import ticks_us, ticks_diff, ticks_add, sleep_us
 import os
@@ -12,6 +12,12 @@ REPEAT_PLAYLIST = False   # True にすると全曲を再生し終えたあと�
 LOOP_COUNT = 1            # 1曲ごとのループ回数 (0=ループしない, -1=無限)
 BUF_SIZE = 2048           # ファイル読み込みバッファ(バイト)
 STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるまでの無音時間(ms)
+
+# ---- クロック ----
+CLOCK_OUT = True          # True: PicoのGPIOからクロックを出力 / False: 外部水晶を使う
+PIN_CLOCK = 16            # クロックを出力するGPIO (物理21番)
+CLOCK_OUT_HZ = 2000000    # 出力したいクロック周波数
+CLOCK_EXT_HZ = 3579545    # CLOCK_OUT = False のときの、外部水晶の周波数
 
 # ---- 音程の調整 ----
 PITCH_SHIFT = 0.0         # 音程を半音単位で上下 (+2.5 なら半音2.5個ぶん高く、負の値で低く。小数も可)
@@ -41,8 +47,6 @@ SINGLE_SOURCE = 0
 # "both" のとき、VGMの1個目と2個目を物理IC側で入れ替える
 SWAP_CHIPS = False
 
-CLOCK_HZ = 3579545        # 外部水晶発振器の周波数 (2個のチップで共通)
-
 # ---- ピン設定 ----
 DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # D0..D7 -> GP0..GP7 (D0 = MSB)。2個で共通
 # 各物理ICの制御ピン (WE, READY, CE)
@@ -55,6 +59,17 @@ data = [Pin(p, Pin.OUT, value=0) for p in DATA_PINS]
 we = [Pin(p[0], Pin.OUT, value=1) for p in CHIP_PINS]      # アクティブLow
 ready = [Pin(p[1], Pin.IN) for p in CHIP_PINS]
 ce = [Pin(p[2], Pin.OUT, value=1) for p in CHIP_PINS]      # アクティブLow (GND直結なら未接続でOK)
+
+
+# ---- クロック出力 (PWMで50%デューティの矩形波) ----
+if CLOCK_OUT:
+    clk_pwm = PWM(Pin(PIN_CLOCK))
+    clk_pwm.freq(CLOCK_OUT_HZ)
+    clk_pwm.duty_u16(32768)                 # デューティ50%
+    CLOCK_HZ = clk_pwm.freq()               # 実際に出力されている周波数を読み戻して使う
+    print("クロック出力: GP%d, 設定 %d Hz -> 実際 %d Hz" % (PIN_CLOCK, CLOCK_OUT_HZ, CLOCK_HZ))
+else:
+    CLOCK_HZ = CLOCK_EXT_HZ                 # 外部水晶発振器の周波数
 
 
 # ---- 出力設定の解決 ----
