@@ -1,9 +1,9 @@
 import machine
-machine.freq(250_000_000)     # 標準は125MHz。2MHzのクロックを正確に出すには250MHzが最適(割り切れる)
+machine.freq(250_000_000)     # 標準は125MHz。PWMの分周が細かくなり、クロックの誤差が小さくなる
 
 from machine import Pin, PWM
 import time
-from time import ticks_us, ticks_diff, ticks_add, sleep_us
+from time import ticks_us, ticks_diff, ticks_add, sleep_us, sleep_ms
 import os
 
 # ---- 再生設定 ----
@@ -14,10 +14,16 @@ BUF_SIZE = 2048           # ファイル読み込みバッファ(バイト)
 STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるまでの無音時間(ms)
 
 # ---- クロック ----
-CLOCK_OUT = True          # True: PicoのGPIOからクロックを出力 / False: 外部水晶を使う
+# "vgm"      : VGMファイルのヘッダのクロックに合わせて、曲ごとに出力周波数を変える
+# "fixed"    : CLOCK_OUT_HZ で固定して出力する
+# "external" : 外部水晶を使う(Picoからは出力しない)
+CLOCK_MODE = "vgm"
 PIN_CLOCK = 16            # クロックを出力するGPIO (物理21番)
-CLOCK_OUT_HZ = 2000000    # 出力したいクロック周波数
-CLOCK_EXT_HZ = 3579545    # CLOCK_OUT = False のときの、外部水晶の周波数
+CLOCK_OUT_HZ = 2000000    # "fixed" のときの周波数。"vgm" でも起動時と、曲のクロックが不明なときに使う
+CLOCK_MIN_HZ = 1000000    # "vgm" のとき、この範囲に収めて出力する (データシートで動作範囲を確認して調整)
+CLOCK_MAX_HZ = 4000000
+CLOCK_EXT_HZ = 3579545    # "external" のときの、外部水晶の周波数
+CLOCK_TOLERANCE = 0.003   # クロック比がこの範囲内なら、音程補正を省略する (0.003 = 0.3%)
 
 # ---- 音程の調整 ----
 PITCH_SHIFT = 0.0         # 音程を半音単位で上下 (+2.5 なら半音2.5個ぶん高く、負の値で低く。小数も可)
@@ -48,7 +54,12 @@ SINGLE_SOURCE = 0
 SWAP_CHIPS = False
 
 # ---- ピン設定 ----
-DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # D0..D7 -> GP0..GP7 (D0 = MSB)。2個で共通
+DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # データバスに使うGPIO (GP0..GP7)。2個で共通
+# 上の各GPIOが、SN76489のどのデータ端子(D0〜D7)につながっているか (D0 = MSB、D7 = LSB)
+#   GP0->D2, GP1->D1, GP2->D0, GP3->D3, GP4->D4, GP5->D5, GP6->D6, GP7->D7
+SN_D = [2, 1, 0, 3, 4, 5, 6, 7]
+BIT_SHIFT = [7 - d for d in SN_D]      # 各GPIOに出すべきビットの位置 (D0がbit7, D7がbit0)
+
 # 各物理ICの制御ピン (WE, READY, CE)
 CHIP_PINS = [
     (10, 11, 12),   # 1個目
@@ -62,14 +73,26 @@ ce = [Pin(p[2], Pin.OUT, value=1) for p in CHIP_PINS]      # アクティブLow 
 
 
 # ---- クロック出力 (PWMで50%デューティの矩形波) ----
-if CLOCK_OUT:
-    clk_pwm = PWM(Pin(PIN_CLOCK))
-    clk_pwm.freq(CLOCK_OUT_HZ)
+CLOCK_HZ = CLOCK_EXT_HZ     # 実機のSN76489に実際に入っているクロック (出力する場合は読み戻した値に更新される)
+clk_pwm = None
+
+
+def set_clock(hz):
+    """PicoのPWMでクロックを出力し、実際に出ている周波数を CLOCK_HZ に記録する"""
+    global CLOCK_HZ
+    clk_pwm.freq(hz)
     clk_pwm.duty_u16(32768)                 # デューティ50%
-    CLOCK_HZ = clk_pwm.freq()               # 実際に出力されている周波数を読み戻して使う
+    CLOCK_HZ = clk_pwm.freq()               # 実際の周波数を読み戻す
+
+
+if CLOCK_MODE == "external":
+    pass
+elif CLOCK_MODE in ("fixed", "vgm"):
+    clk_pwm = PWM(Pin(PIN_CLOCK))
+    set_clock(CLOCK_OUT_HZ)
     print("クロック出力: GP%d, 設定 %d Hz -> 実際 %d Hz" % (PIN_CLOCK, CLOCK_OUT_HZ, CLOCK_HZ))
 else:
-    CLOCK_HZ = CLOCK_EXT_HZ                 # 外部水晶発振器の周波数
+    raise ValueError('CLOCK_MODE は "vgm" / "fixed" / "external" のいずれかにしてください')
 
 
 # ---- 出力設定の解決 ----
@@ -103,8 +126,8 @@ def _wait_ready(pin, level, timeout_us=1000):
 
 def sn_write(n, byte):
     """n番目(0または1)の物理ICへ1バイト書き込む(WE/READYハンドシェイク付き)"""
-    for i, p in enumerate(data):
-        p.value((byte >> (7 - i)) & 1)   # D0がMSB
+    for p, s in zip(data, BIT_SHIFT):
+        p.value((byte >> s) & 1)         # 各GPIOに、つながっているD端子のビットを出す
     c = ce[n]
     w = we[n]
     rd = ready[n]
@@ -136,7 +159,7 @@ def make_writer(sn_clock, n, shift=0.0):
     クロックの違いと音程シフトを、音程レジスタの値の補正でまとめて行う"""
     # N' = N * (実機クロック / ファイルクロック) / 2^(シフト/12)
     ratio = (CLOCK_HZ / sn_clock) * 2 ** (-shift / 12)
-    if abs(ratio - 1) <= 0.001:              # 補正が不要なら、そのまま書き込む
+    if abs(ratio - 1) <= CLOCK_TOLERANCE:    # 補正が不要なら、そのまま書き込む
         def plain(b):
             sn_write(n, b)
         return plain
@@ -305,6 +328,13 @@ def play_vgm(path):
             print("このファイルにSN76489のデータはありません")
             return
 
+        # クロックをVGMに合わせる (直前に消音済みの状態で切り替える)
+        if CLOCK_MODE == "vgm":
+            target = min(max(sn_clock, CLOCK_MIN_HZ), CLOCK_MAX_HZ)
+            set_clock(target)
+            sleep_ms(10)                         # クロックが安定するまで待つ
+            print("クロック出力をVGMに合わせました: %d Hz -> 実際 %d Hz" % (target, CLOCK_HZ))
+
         # この曲の音程シフト量(半音)
         shift = PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT)
 
@@ -327,7 +357,7 @@ def play_vgm(path):
         if w0 is None and w1 is None:
             print("再生できるデータがありません(このファイルにその番号のチップがありません)")
             return
-        if abs(sn_clock - CLOCK_HZ) * 1000 > CLOCK_HZ:
+        if abs(CLOCK_HZ / sn_clock - 1) > CLOCK_TOLERANCE:
             print("クロック補正あり: ファイル %d Hz -> 実機 %d Hz" % (sn_clock, CLOCK_HZ))
         if shift != 0:
             print("音程シフト:", shift, "半音 (ノイズの固定周波数は変わりません)")
