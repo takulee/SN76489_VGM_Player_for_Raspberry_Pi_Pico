@@ -55,10 +55,6 @@ SWAP_CHIPS = False
 
 # ---- ピン設定 ----
 DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # データバスに使うGPIO (GP0..GP7)。2個で共通
-# 上の各GPIOが、SN76489のどのデータ端子(D0〜D7)につながっているか (D0 = MSB、D7 = LSB)
-#   GP0->D2, GP1->D1, GP2->D0, GP3->D3, GP4->D4, GP5->D5, GP6->D6, GP7->D7
-SN_D = [2, 1, 0, 3, 4, 5, 6, 7]
-BIT_SHIFT = [7 - d for d in SN_D]      # 各GPIOに出すべきビットの位置 (D0がbit7, D7がbit0)
 
 # 各物理ICの制御ピン (WE, READY, CE)
 CHIP_PINS = [
@@ -126,8 +122,8 @@ def _wait_ready(pin, level, timeout_us=1000):
 
 def sn_write(n, byte):
     """n番目(0または1)の物理ICへ1バイト書き込む(WE/READYハンドシェイク付き)"""
-    for p, s in zip(data, BIT_SHIFT):
-        p.value((byte >> s) & 1)         # 各GPIOに、つながっているD端子のビットを出す
+    for i, p in enumerate(data):
+        p.value((byte >> (7 - i)) & 1)   # D0がMSB
     c = ce[n]
     w = we[n]
     rd = ready[n]
