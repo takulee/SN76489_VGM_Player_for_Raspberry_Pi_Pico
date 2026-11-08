@@ -8,6 +8,8 @@ import os
 
 # ---- 再生設定 ----
 VGM_DIR = "/vgm"          # VGMファイルを置いたフォルダ ("/" ならルート)
+RECURSIVE = True          # True にするとサブフォルダ内のVGMも再生する
+MAX_DEPTH = 4             # 何階層下まで探すか (0 = 指定フォルダのみ)
 REPEAT_PLAYLIST = False   # True にすると全曲を再生し終えたあと最初から繰り返す
 LOOP_COUNT = 1            # 1曲ごとのループ回数 (0=ループしない, -1=無限)
 BUF_SIZE = 2048           # ファイル読み込みバッファ(バイト)
@@ -332,8 +334,8 @@ def play_vgm(path):
             print("クロック出力をVGMに合わせました: %d Hz -> 実際 %d Hz" % (target, CLOCK_HZ))
 
         # この曲の音程シフト量(半音)
-        shift = PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT)
-
+        shift = PITCH_BY_FILE.get(path, PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT))
+        
         # VGMのv個目のデータを送る書き込み関数 (送り先がない/ファイルにそのチップがなければ None)
         # 流れ: VGMのデータ -> 音量調整・ミュート -> 音程補正 -> 物理ICへ書き込み
         w = [None, None]
@@ -456,8 +458,9 @@ def is_vgm(path):
         return False
 
 
-def list_vgm(folder):
-    """フォルダ内の VGM ファイルを、ファイル名順に並べて返す"""
+def list_vgm(folder, depth=0):
+    """フォルダ内(RECURSIVE=Trueならサブフォルダも)の VGM ファイルを、名前順に並べて返す。
+    サブフォルダは、名前順の位置でその中身を展開する"""
     try:
         names = os.listdir(folder)
     except OSError:
@@ -465,15 +468,17 @@ def list_vgm(folder):
         return []
     files = []
     for nm in sorted(names):
-        if nm.startswith("."):
+        if nm.startswith("."):                  # 隠しファイル・フォルダは除外
             continue
         path = folder.rstrip("/") + "/" + nm
         try:
-            if os.stat(path)[0] & 0x4000:       # フォルダは除外
-                continue
+            is_dir = os.stat(path)[0] & 0x4000
         except OSError:
             continue
-        if is_vgm(path):
+        if is_dir:
+            if RECURSIVE and depth < MAX_DEPTH:
+                files.extend(list_vgm(path, depth + 1))
+        elif is_vgm(path):
             files.append(path)
     return files
 
