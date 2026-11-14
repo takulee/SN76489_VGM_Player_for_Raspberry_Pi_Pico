@@ -7,7 +7,7 @@ from time import ticks_us, ticks_diff, ticks_add, sleep_us, sleep_ms
 import os
 
 # ---- 再生設定 ----
-VGM_DIR = "/vgm"          # VGMファイルを置いたフォルダ ("/" ならルート)
+VGM_DIR = "/sd/vgm"       # microSD内のVGMフォルダ
 RECURSIVE = True          # True にするとサブフォルダ内のVGMも再生する
 MAX_DEPTH = 4             # 何階層下まで探すか (0 = 指定フォルダのみ)
 REPEAT_PLAYLIST = False   # True にすると全曲を再生し終えたあと最初から繰り返す
@@ -15,12 +15,17 @@ LOOP_COUNT = 1            # 1曲ごとのループ回数 (0=ループしない, 
 BUF_SIZE = 2048           # ファイル読み込みバッファ(バイト)
 STARTUP_DELAY_MS = 1500   # 電源ON後、最初の曲を再生し始めるまでの無音時間(ms)
 
+# ---- microSD ----
+SD_MOUNT = "/sd"          # microSDのマウント先
+PIN_SD_CS, PIN_SD_SCK, PIN_SD_MOSI, PIN_SD_MISO = 17, 18, 19, 16   # SPI0
+SD_BAUDRATE = 4000000     # SPIの速度。読み込みエラーが出るなら下げる (例: 1320000)
+
 # ---- クロック ----
 # "vgm"      : VGMファイルのヘッダのクロックに合わせて、曲ごとに出力周波数を変える
 # "fixed"    : CLOCK_OUT_HZ で固定して出力する
 # "external" : 外部水晶を使う(Picoからは出力しない)
 CLOCK_MODE = "vgm"
-PIN_CLOCK = 16            # クロックを出力するGPIO (物理21番)
+PIN_CLOCK = 22            # クロックを出力するGPIO
 CLOCK_OUT_HZ = 2000000    # "fixed" のときの周波数。"vgm" でも起動時と、曲のクロックが不明なときに使う
 CLOCK_MIN_HZ = 1000000    # "vgm" のとき、この範囲に収めて出力する (データシートで動作範囲を確認して調整)
 CLOCK_MAX_HZ = 4000000
@@ -29,7 +34,7 @@ CLOCK_TOLERANCE = 0.003   # クロック比がこの範囲内なら、音程補�
 
 # ---- 音程の調整 ----
 PITCH_SHIFT = 0.0         # 音程を半音単位で上下 (+2.5 なら半音2.5個ぶん高く、負の値で低く。小数も可)
-PITCH_BY_FILE = {}        # 曲ごとに変える場合: {"01_xxx.vgm": 2.5, "02_yyy": -1}
+PITCH_BY_FILE = {}        # 曲ごとに変える場合: {"01_xxx.vgm": 2.5, "/sd/vgm/album/02_yyy": -1}  (ファイル名またはフルパス)
 
 # ---- 音量の調整 (下げる方向のみ。上げることはできません) ----
 MASTER_ATTEN = 0          # 全体の音量を下げる段数 (1段 = 約2dB、0=そのまま、15=無音)
@@ -56,8 +61,7 @@ SINGLE_SOURCE = 0
 SWAP_CHIPS = False
 
 # ---- ピン設定 ----
-DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # データバスに使うGPIO (GP0..GP7)。2個で共通
-
+DATA_PINS = [0, 1, 2, 3, 4, 5, 6, 7]   # D0..D7 -> GP0..GP7 (D0 = MSB)。2個で共通
 # 各物理ICの制御ピン (WE, READY, CE)
 CHIP_PINS = [
     (10, 11, 12),   # 1個目
@@ -91,6 +95,33 @@ elif CLOCK_MODE in ("fixed", "vgm"):
     print("クロック出力: GP%d, 設定 %d Hz -> 実際 %d Hz" % (PIN_CLOCK, CLOCK_OUT_HZ, CLOCK_HZ))
 else:
     raise ValueError('CLOCK_MODE は "vgm" / "fixed" / "external" のいずれかにしてください')
+
+
+# ---- microSDのマウント ----
+def mount_sd():
+    """microSDを SD_MOUNT にマウントする。成功したら True"""
+    try:
+        import sdcard                        # micropython-lib の sdcard.py (/lib に必要)
+    except ImportError:
+        print("sdcard.py が見つかりません。Picoの /lib に入れてください")
+        return False
+    try:
+        spi = machine.SPI(0, sck=Pin(PIN_SD_SCK), mosi=Pin(PIN_SD_MOSI), miso=Pin(PIN_SD_MISO))
+        cs = Pin(PIN_SD_CS, Pin.OUT, value=1)
+        try:
+            sd = sdcard.SDCard(spi, cs, baudrate=SD_BAUDRATE)
+        except TypeError:                    # baudrate引数のない古い sdcard.py
+            sd = sdcard.SDCard(spi, cs)
+        try:
+            os.umount(SD_MOUNT)              # 再実行時に、すでにマウントされていても大丈夫なように
+        except OSError:
+            pass
+        os.mount(sd, SD_MOUNT)
+    except OSError as e:
+        print("microSDをマウントできません:", e)
+        return False
+    print("microSDをマウントしました:", SD_MOUNT)
+    return True
 
 
 # ---- 出力設定の解決 ----
@@ -333,9 +364,10 @@ def play_vgm(path):
             sleep_ms(10)                         # クロックが安定するまで待つ
             print("クロック出力をVGMに合わせました: %d Hz -> 実際 %d Hz" % (target, CLOCK_HZ))
 
-        # この曲の音程シフト量(半音)
-        shift = PITCH_BY_FILE.get(path, PITCH_BY_FILE.get(path.rsplit("/", 1)[-1], PITCH_SHIFT))
-        
+        # この曲の音程シフト量(半音)。フルパスで指定があればそれを、なければファイル名で探す
+        disp = _disp(path)
+        shift = PITCH_BY_FILE.get(disp, PITCH_BY_FILE.get(disp.rsplit("/", 1)[-1], PITCH_SHIFT))
+
         # VGMのv個目のデータを送る書き込み関数 (送り先がない/ファイルにそのチップがなければ None)
         # 流れ: VGMのデータ -> 音量調整・ミュート -> 音程補正 -> 物理ICへ書き込み
         w = [None, None]
@@ -449,8 +481,17 @@ def play_vgm(path):
 
 
 # ---- プレイリスト (拡張子ではなく中身で判定) ----
+def _disp(path):
+    """表示用に、パスを文字列にする。UTF-8で読めない部分(Shift-JISなど)は ? にする"""
+    if isinstance(path, str):
+        return path
+    try:
+        return path.decode()
+    except UnicodeError:
+        return "".join(chr(c) if 32 <= c < 127 else "?" for c in path)
+    
 def is_vgm(path):
-    """ファイルの先頭4バイトで VGM かどうかを判定する"""
+    """ファイルの先頭4バイトで VGM かどうかを判定する (pathは文字列でもバイト列でも可)"""
     try:
         with open(path, "rb") as f:
             return f.read(4) == b"Vgm "
@@ -460,25 +501,26 @@ def is_vgm(path):
 
 def list_vgm(folder, depth=0):
     """フォルダ内(RECURSIVE=Trueならサブフォルダも)の VGM ファイルを、名前順に並べて返す。
-    サブフォルダは、名前順の位置でその中身を展開する"""
+    パスはバイト列のまま扱う。サブフォルダは、名前順の位置でその中身を展開する"""
+    if isinstance(folder, str):
+        folder = folder.encode()
     try:
-        names = os.listdir(folder)
+        entries = list(os.ilistdir(folder))     # バイト列のパスで呼ぶと、名前もバイト列で返る
     except OSError:
-        print("フォルダが見つかりません:", folder)
+        print("フォルダが見つかりません:", _disp(folder))
         return []
+    entries.sort(key=lambda e: e[0])
+    base = folder.rstrip(b"/") + b"/"
     files = []
-    for nm in sorted(names):
-        if nm.startswith("."):                  # 隠しファイル・フォルダは除外
+    for ent in entries:
+        nm = ent[0]
+        if nm.startswith(b"."):                 # 隠しファイル・フォルダは除外
             continue
-        path = folder.rstrip("/") + "/" + nm
-        try:
-            is_dir = os.stat(path)[0] & 0x4000
-        except OSError:
-            continue
-        if is_dir:
+        path = base + nm
+        if ent[1] == 0x4000:                    # フォルダ
             if RECURSIVE and depth < MAX_DEPTH:
                 files.extend(list_vgm(path, depth + 1))
-        elif is_vgm(path):
+        elif ent[1] == 0x8000 and is_vgm(path): # 通常のファイル
             files.append(path)
     return files
 
@@ -490,11 +532,11 @@ def play_all(folder=VGM_DIR):
             print("VGMファイルが見つかりません:", folder)
             return
         for i, path in enumerate(files):
-            print("[%d/%d] %s" % (i + 1, len(files), path))
+            print("[%d/%d] %s" % (i + 1, len(files), _disp(path)))
             try:
                 play_vgm(path)
             except OSError as e:
-                print("読み込みエラー:", path, e)
+                print("読み込みエラー:", _disp(path), e)
             mute_all()                    # 曲の切れ目で音が残らないように
             time.sleep_ms(500)
         if not REPEAT_PLAYLIST:
@@ -503,7 +545,8 @@ def play_all(folder=VGM_DIR):
 
 try:
     startup_mute()                    # まず消音
-    time.sleep_ms(STARTUP_DELAY_MS)   # 無音のまま少し待ってから再生開始
-    play_all()
+    if mount_sd():                    # microSDをマウントできたら再生
+        time.sleep_ms(STARTUP_DELAY_MS)   # 無音のまま少し待ってから再生開始
+        play_all()
 finally:
     mute_all()
